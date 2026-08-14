@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile } from "@ffmpeg/util";
+import { supabase } from "./lib/supabase";
+import { subscribeToSchemaChanges } from "./lib/realtime";
 
 /* ------------------------------------------------------------------ */
 /*  Core engine configuration                                          */
@@ -182,6 +184,15 @@ function App() {
   const doneRef = useRef(false);
   const convertTimerRef = useRef<number | null>(null);
   const logRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    const channel = subscribeToSchemaChanges((payload) => {
+      console.log("[نغم] Change received!", payload);
+    });
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   const loadFFmpeg = useCallback(async () => {
     const gen = ++loadGenRef.current;
