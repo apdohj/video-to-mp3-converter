@@ -99,6 +99,32 @@ async function fetchBlobWithProgress(
   return URL.createObjectURL(new Blob(chunks as BlobPart[], { type: mime }));
 }
 
+/*
+ * Tries to load a video blob in the browser. Returns true when the browser
+ * can actually play it (fires `canplay`), false when it errors out.
+ * Falls back to `true` on timeout so huge files are not stalled forever.
+ */
+function canPlayVideoUrl(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const v = document.createElement("video");
+    v.muted = true;
+    v.preload = "auto";
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      v.removeAttribute("src");
+      v.load();
+      resolve(ok);
+    };
+    const timer = window.setTimeout(() => finish(true), 4000);
+    v.oncanplay = () => finish(true);
+    v.onerror = () => finish(false);
+    v.src = url;
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Logo                                                               */
 /* ------------------------------------------------------------------ */
@@ -166,6 +192,7 @@ function App() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [isVideoFile, setIsVideoFile] = useState(false);
+  const [previewFailed, setPreviewFailed] = useState(false);
 
   const [format, setFormat] = useState<OutputFormat>("mp3");
   const [bitrate, setBitrate] = useState(192);
@@ -316,6 +343,7 @@ function App() {
     if (resultUrl) URL.revokeObjectURL(resultUrl);
     setFile(f);
     setIsVideoFile(isVideo);
+    setPreviewFailed(false);
     setPreviewUrl(URL.createObjectURL(f));
     setResultUrl("");
     setResultName("");
@@ -368,6 +396,14 @@ function App() {
       if (!ffmpeg) throw new Error("المحرك غير جاهز");
       logRef.current = [];
 
+      const makeConvError = () => {
+        const tail = logRef.current
+          .slice(-4)
+          .join(" ")
+          .slice(0, 400);
+        return new Error(`فشل التحويل. ${tail}`);
+      };
+
       const inExt = getExt(file.name);
       const inFile = `input.${inExt || "bin"}`;
       const outExt = format;
@@ -375,9 +411,8 @@ function App() {
 
       await ffmpeg.writeFile(inFile, await fetchFile(file));
 
-      let args: string[];
       if (format === "mp3") {
-        args = [
+        const code = await ffmpeg.exec([
           "-i",
           inFile,
           "-vn",
@@ -389,41 +424,72 @@ function App() {
           "44100",
           "-y",
           outFile,
-        ];
+        ]);
+        if (code !== 0) throw makeConvError();
       } else if (isVideoFile) {
-        // Video -> MP4: instant remux (lossless copy) when possible
-        args = ["-i", inFile, "-c", "copy", "-movflags", "+faststart", "-y", outFile];
-      } else {
-        // Audio -> MP4 (AAC inside MP4 container)
-        args = ["-i", inFile, "-vn", "-c:a", "aac", "-b:a", "192k", "-y", outFile];
-      }
-
-      let code = await ffmpeg.exec(args);
-
-      if (code !== 0 && format === "mp4" && isVideoFile) {
-        // Fallback: keep video stream, re-encode audio to AAC
-        code = await ffmpeg.exec([
+        /*
+         * Video -> MP4.
+         * 1) Try an instant lossless remux (`-c copy`).
+         * 2) Verify the result actually plays in the browser.
+         * 3) If the browser refuses it (e.g. WebM/MKV codecs copied into
+         *    an MP4 container), re-encode to universal H.264 + AAC.
+         */
+        let code = await ffmpeg.exec([
           "-i",
           inFile,
-          "-c:v",
+          "-c",
           "copy",
-          "-c:a",
-          "aac",
-          "-b:a",
-          "192k",
           "-movflags",
           "+faststart",
           "-y",
           outFile,
         ]);
-      }
 
-      if (code !== 0) {
-        const tail = logRef.current
-          .slice(-4)
-          .join(" ")
-          .slice(0, 400);
-        throw new Error(`فشل التحويل. ${tail}`);
+        if (code === 0) {
+          const bytes = await ffmpeg.readFile(outFile);
+          const testUrl = URL.createObjectURL(
+            new Blob([bytes as BlobPart], { type: "video/mp4" })
+          );
+          const playable = await canPlayVideoUrl(testUrl);
+          URL.revokeObjectURL(testUrl);
+
+          if (!playable) {
+            code = await ffmpeg.exec([
+              "-i",
+              inFile,
+              "-c:v",
+              "libx264",
+              "-preset",
+              "veryfast",
+              "-crf",
+              "23",
+              "-c:a",
+              "aac",
+              "-b:a",
+              "192k",
+              "-movflags",
+              "+faststart",
+              "-y",
+              outFile,
+            ]);
+          }
+        }
+
+        if (code !== 0) throw makeConvError();
+      } else {
+        // Audio -> MP4 (AAC inside MP4 container)
+        const code = await ffmpeg.exec([
+          "-i",
+          inFile,
+          "-vn",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-y",
+          outFile,
+        ]);
+        if (code !== 0) throw makeConvError();
       }
 
       doneRef.current = true;
@@ -473,6 +539,7 @@ function App() {
     setFile(null);
     setPreviewUrl("");
     setIsVideoFile(false);
+    setPreviewFailed(false);
     setResultUrl("");
     setResultName("");
     setConvertProgress(0);
@@ -629,6 +696,7 @@ function App() {
                       src={previewUrl}
                       controls
                       className="w-full max-h-96"
+                      onError={() => setPreviewFailed(true)}
                     />
                   ) : (
                     <audio
@@ -636,7 +704,20 @@ function App() {
                       controls
                       className="w-full p-6"
                       preload="metadata"
+                      onError={() => setPreviewFailed(true)}
                     />
+                  )}
+                  {previewFailed && (
+                    <div className="p-6 text-center">
+                      <div className="text-5xl mb-3">⚠️</div>
+                      <p className="text-white font-bold mb-1">
+                        لا يمكن للمتصفح معاينة هذا التنسيق مباشرة
+                      </p>
+                      <p className="text-slate-300 text-sm">
+                        لا تقلق — يمكنك تحويله بأي حال! اختر صيغة الإخراج واضغط
+                        على زر التحويل.
+                      </p>
+                    </div>
                   )}
                 </div>
                 <div className="mt-3 bg-indigo-50 rounded-xl p-4 flex flex-wrap gap-x-6 gap-y-1 text-sm font-semibold text-slate-700 shadow">
@@ -693,8 +774,8 @@ function App() {
 
                 {format === "mp4" && isVideoFile && (
                   <p className="mt-4 text-sm text-slate-500">
-                    ⚡ تحويل MP4 يتم بنسخ الصوت والفيديو مباشرة بدون فقدان الجودة
-                    وبسرعة عالية جداً.
+                    ⚡ نسخ سريع بدون فقدان الجودة عندما يكون ممكناً، وإعادة
+                    ترميز تلقائية إلى H.264 لضمان تشغيل النتيجة في كل المتصفحات.
                   </p>
                 )}
               </div>
@@ -764,7 +845,23 @@ function App() {
                     {resultFormat === "mp3" ? (
                       <audio src={resultUrl} controls className="w-full h-14" />
                     ) : (
-                      <video src={resultUrl} controls className="w-full max-h-96 rounded-xl" />
+                      <video
+                        src={resultUrl}
+                        controls
+                        className="w-full max-h-96 rounded-xl"
+                        onError={(e) => {
+                          const el = e.currentTarget;
+                          el.classList.add("hidden");
+                          const note = el.nextElementSibling as HTMLElement | null;
+                          if (note) note.classList.remove("hidden");
+                        }}
+                      />
+                    )}
+                    {resultFormat === "mp4" && (
+                      <p className="hidden mt-3 text-sm text-amber-600 font-bold">
+                        المتصفح لم يشغّل المعاينة، لكن يمكنك تنزيل الملف وتشغيله
+                        في مشغل فيديو آخر.
+                      </p>
                     )}
                   </div>
 
