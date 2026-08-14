@@ -64,7 +64,7 @@ const getExt = (name: string) => {
 
 const NOTES = ["🎵", "🎶", "♪", "♫", "🎼", "♬", "♩", "🎶"];
 
-type OutputFormat = "mp3" | "mp4";
+type OutputFormat = "mp3" | "mp4" | "split";
 type EngineState = "loading" | "ready" | "error";
 
 /* ------------------------------------------------------------------ */
@@ -199,9 +199,16 @@ function App() {
 
   const [isConverting, setIsConverting] = useState(false);
   const [convertProgress, setConvertProgress] = useState(0);
+  const [convertStatus, setConvertStatus] = useState("");
   const [resultUrl, setResultUrl] = useState("");
   const [resultName, setResultName] = useState("");
   const [resultFormat, setResultFormat] = useState<OutputFormat>("mp3");
+  const [splitResult, setSplitResult] = useState<{
+    instrumentalUrl: string;
+    instrumentalName: string;
+    vocalsUrl: string;
+    vocalsName: string;
+  } | null>(null);
 
   const ffmpegRef = useRef<FFmpeg | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -341,6 +348,7 @@ function App() {
     const isVideo = f.type.startsWith("video/") || VIDEO_EXTS.has(ext);
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     if (resultUrl) URL.revokeObjectURL(resultUrl);
+    clearSplit();
     setFile(f);
     setIsVideoFile(isVideo);
     setPreviewFailed(false);
@@ -348,6 +356,7 @@ function App() {
     setResultUrl("");
     setResultName("");
     setConvertProgress(0);
+    setConvertStatus("");
     realProgressRef.current = 0;
   };
 
@@ -389,6 +398,8 @@ function App() {
     setIsConverting(true);
     setResultUrl("");
     setResultName("");
+    clearSplit();
+    setConvertStatus("");
     startFakeProgress();
 
     try {
@@ -406,10 +417,121 @@ function App() {
 
       const inExt = getExt(file.name);
       const inFile = `input.${inExt || "bin"}`;
-      const outExt = format;
-      const outFile = `output.${outExt}`;
+      const baseName = file.name.replace(/\.[^/.]+$/, "");
 
       await ffmpeg.writeFile(inFile, await fetchFile(file));
+
+      if (format === "split") {
+        /* --------------------------------------------------------
+         * Vocal isolation (karaoke, DSP):
+         *  1) Decode to stereo WAV
+         *  2) Instrumental = side signal (L-R cancels center/vocals)
+         *  3) Vocals      = original + phase-inverted instrumental
+         *  4) Encode both to MP3
+         * -------------------------------------------------------- */
+        setConvertStatus("جارٍ استخراج الصوت من الملف...");
+        let code = await ffmpeg.exec([
+          "-i",
+          inFile,
+          "-vn",
+          "-ac",
+          "2",
+          "-ar",
+          "44100",
+          "-y",
+          "audio.wav",
+        ]);
+        if (code !== 0) throw makeConvError();
+
+        setConvertStatus("جارٍ عزل الموسيقى (بدون غناء)...");
+        code = await ffmpeg.exec([
+          "-i",
+          "audio.wav",
+          "-af",
+          "pan=stereo|c0=c0-c1|c1=c1-c0",
+          "-y",
+          "instrumental.wav",
+        ]);
+        if (code !== 0) throw makeConvError();
+
+        setConvertStatus("جارٍ عزل الغناء (تقريبي)...");
+        code = await ffmpeg.exec([
+          "-i",
+          "audio.wav",
+          "-i",
+          "instrumental.wav",
+          "-filter_complex",
+          "[0:a]volume=1.0[orig];[1:a]volume=-1.0[inv];[orig][inv]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[v]",
+          "-map",
+          "[v]",
+          "-y",
+          "vocals.wav",
+        ]);
+        if (code !== 0) throw makeConvError();
+
+        setConvertStatus("جارٍ الترميز النهائي إلى MP3...");
+        code = await ffmpeg.exec([
+          "-i",
+          "instrumental.wav",
+          "-vn",
+          "-acodec",
+          "libmp3lame",
+          "-b:a",
+          "192k",
+          "-ar",
+          "44100",
+          "-y",
+          "instrumental.mp3",
+        ]);
+        if (code !== 0) throw makeConvError();
+
+        code = await ffmpeg.exec([
+          "-i",
+          "vocals.wav",
+          "-vn",
+          "-acodec",
+          "libmp3lame",
+          "-b:a",
+          "192k",
+          "-ar",
+          "44100",
+          "-y",
+          "vocals.mp3",
+        ]);
+        if (code !== 0) throw makeConvError();
+
+        doneRef.current = true;
+        setConvertProgress(96);
+
+        const instrumentalData = await ffmpeg.readFile("instrumental.mp3");
+        const vocalsData = await ffmpeg.readFile("vocals.mp3");
+
+        setSplitResult({
+          instrumentalUrl: URL.createObjectURL(
+            new Blob([instrumentalData as BlobPart], { type: "audio/mpeg" })
+          ),
+          instrumentalName: `${baseName}_بدون_غناء.mp3`,
+          vocalsUrl: URL.createObjectURL(
+            new Blob([vocalsData as BlobPart], { type: "audio/mpeg" })
+          ),
+          vocalsName: `${baseName}_غناء_تقريبي.mp3`,
+        });
+        setConvertProgress(100);
+
+        ["audio.wav", "instrumental.wav", "vocals.wav", "instrumental.mp3", "vocals.mp3"].forEach(
+          async (f) => {
+            try {
+              await ffmpeg.deleteFile(f);
+            } catch {
+              /* noop */
+            }
+          }
+        );
+        return;
+      }
+
+      const outExt = format;
+      const outFile = `output.${outExt}`;
 
       if (format === "mp3") {
         const code = await ffmpeg.exec([
@@ -523,19 +645,31 @@ function App() {
     }
   };
 
-  const download = () => {
-    if (!resultUrl || !resultName) return;
+  const downloadUrl = (url: string, name: string) => {
     const a = document.createElement("a");
-    a.href = resultUrl;
-    a.download = resultName;
+    a.href = url;
+    a.download = name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
+  const download = () => {
+    if (resultUrl && resultName) downloadUrl(resultUrl, resultName);
+  };
+
+  const clearSplit = () => {
+    if (splitResult) {
+      URL.revokeObjectURL(splitResult.vocalsUrl);
+      URL.revokeObjectURL(splitResult.instrumentalUrl);
+    }
+    setSplitResult(null);
+  };
+
   const reset = () => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     if (resultUrl) URL.revokeObjectURL(resultUrl);
+    clearSplit();
     setFile(null);
     setPreviewUrl("");
     setIsVideoFile(false);
@@ -543,6 +677,7 @@ function App() {
     setResultUrl("");
     setResultName("");
     setConvertProgress(0);
+    setConvertStatus("");
     realProgressRef.current = 0;
     if (inputRef.current) inputRef.current.value = "";
   };
@@ -586,7 +721,8 @@ function App() {
             نغم <span className="brand-gradient">NAGHAM</span>
           </h1>
           <p className="text-2xl md:text-3xl font-bold mb-2">
-            حوّل فيديوهاتك وملفاتك الصوتية إلى MP3 و MP4
+            حوّل فيديوهاتك وملفاتك الصوتية إلى MP3 و MP4، وافصل الغناء عن
+            الموسيقى
           </p>
           <p className="text-base md:text-lg opacity-90">
             تحويل سريع وآمن 100% — كل شيء يتم داخل متصفحك بدون رفع أي ملف
@@ -753,6 +889,17 @@ function App() {
                   >
                     🎬 MP4 <span className="text-sm font-bold">(فيديو)</span>
                   </button>
+                  <button
+                    onClick={() => setFormat("split")}
+                    className={`px-8 py-4 rounded-2xl font-black text-lg transition-all border-2 shadow ${
+                      format === "split"
+                        ? "bg-gradient-to-r from-amber-500 to-orange-600 text-white border-transparent scale-105"
+                        : "bg-white text-slate-600 border-slate-300 hover:border-amber-400"
+                    }`}
+                  >
+                    🎤 فصل الصوت{" "}
+                    <span className="text-sm font-bold">(كاريوكي)</span>
+                  </button>
                 </div>
 
                 {format === "mp3" && (
@@ -778,10 +925,22 @@ function App() {
                     ترميز تلقائية إلى H.264 لضمان تشغيل النتيجة في كل المتصفحات.
                   </p>
                 )}
+
+                {format === "split" && (
+                  <div className="mt-4 bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 text-sm text-amber-800">
+                    <p className="font-black mb-1">🎤 كيف يعمل عزل الصوت؟</p>
+                    <p>
+                      ستحصل على ملفين MP3: <b>الأغنية بدون غناء</b> (للكاريوكي)
+                      و<b>الغناء فقط</b> (تقريبي) عبر تقنية معالجة الصوت DSP —
+                      أفضل النتائج مع الأغاني التي يكون صوت الغناء في المنتصف
+                      (وسط القناة الستيريو).
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Convert / Progress */}
-              {!resultUrl && (
+              {!resultUrl && !splitResult && (
                 <div className="flex gap-4 justify-center flex-wrap mb-6">
                   <button
                     onClick={convert}
@@ -797,7 +956,9 @@ function App() {
                       <span>⏳ انتظر تحميل المحرك...</span>
                     ) : (
                       <span>
-                        🎵 تحويل إلى {format.toUpperCase()}
+                        {format === "split"
+                          ? "🎤 فصل الصوت الآن!"
+                          : `🎵 تحويل إلى ${format.toUpperCase()}`}
                       </span>
                     )}
                   </button>
@@ -822,7 +983,9 @@ function App() {
                     </div>
                   </div>
                   <p className="text-center text-lg font-bold mt-3 text-slate-600">
-                    🔄 جارٍ التحويل... انتظر قليلاً
+                    {convertStatus
+                      ? `🔄 ${convertStatus}`
+                      : "🔄 جارٍ التحويل... انتظر قليلاً"}
                   </p>
                 </div>
               )}
@@ -882,12 +1045,85 @@ function App() {
                   </div>
                 </div>
               )}
+
+              {/* Split result */}
+              {splitResult && (
+                <div className="bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50 border-4 border-amber-500 rounded-3xl p-8 text-center shadow-2xl">
+                  <div className="text-7xl mb-4">🎤</div>
+                  <h3 className="text-3xl font-black text-amber-800 mb-2">
+                    تم فصل الصوت!
+                  </h3>
+                  <p className="text-slate-600 font-semibold mb-8">
+                    مساران MP3 جاهزان للتحميل
+                  </p>
+
+                  <div className="grid md:grid-cols-2 gap-6 mb-8">
+                    <div className="bg-white rounded-2xl p-6 shadow-xl">
+                      <p className="font-black text-lg text-slate-700 mb-1">
+                        🎶 بدون غناء (كاريوكي)
+                      </p>
+                      <p className="text-xs text-slate-400 mb-4">
+                        {splitResult.instrumentalName}
+                      </p>
+                      <audio
+                        src={splitResult.instrumentalUrl}
+                        controls
+                        className="w-full h-12 mb-4"
+                      />
+                      <button
+                        onClick={() =>
+                          downloadUrl(
+                            splitResult.instrumentalUrl,
+                            splitResult.instrumentalName
+                          )
+                        }
+                        className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-6 py-3 rounded-xl font-bold hover:shadow-xl transition-all shadow"
+                      >
+                        ⬇️ تحميل بدون غناء
+                      </button>
+                    </div>
+                    <div className="bg-white rounded-2xl p-6 shadow-xl">
+                      <p className="font-black text-lg text-slate-700 mb-1">
+                        🎙️ الغناء فقط (تقريبي)
+                      </p>
+                      <p className="text-xs text-slate-400 mb-4">
+                        {splitResult.vocalsName}
+                      </p>
+                      <audio
+                        src={splitResult.vocalsUrl}
+                        controls
+                        className="w-full h-12 mb-4"
+                      />
+                      <button
+                        onClick={() =>
+                          downloadUrl(
+                            splitResult.vocalsUrl,
+                            splitResult.vocalsName
+                          )
+                        }
+                        className="w-full bg-gradient-to-r from-pink-600 to-rose-600 text-white px-6 py-3 rounded-xl font-bold hover:shadow-xl transition-all shadow"
+                      >
+                        ⬇️ تحميل الغناء
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-5 justify-center flex-wrap">
+                    <button
+                      onClick={reset}
+                      className="bg-gradient-to-r from-purple-600 to-pink-600 text-white px-12 py-5 rounded-full font-black text-2xl hover:shadow-2xl transition-all hover:scale-105 shadow-lg"
+                    >
+                      ➕ فصل صوت ملف آخر
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </section>
 
         {/* ---------------- Features ---------------- */}
-        <div className="grid md:grid-cols-3 gap-6 mb-8">
+        <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <div className="bg-white/90 backdrop-blur rounded-2xl p-8 text-center shadow-xl hover:scale-105 transition-all">
             <div className="text-6xl mb-4">⚡</div>
             <h4 className="font-black text-2xl mb-2">سرعة فائقة</h4>
@@ -902,6 +1138,11 @@ function App() {
             <div className="text-6xl mb-4">🎚️</div>
             <h4 className="font-black text-2xl mb-2">جودة عالية</h4>
             <p className="text-slate-600">MP3 حتى 320 كيلوبت + MP4 بدون فقدان</p>
+          </div>
+          <div className="bg-white/90 backdrop-blur rounded-2xl p-8 text-center shadow-xl hover:scale-105 transition-all">
+            <div className="text-6xl mb-4">🎤</div>
+            <h4 className="font-black text-2xl mb-2">عزل الغناء</h4>
+            <p className="text-slate-600">كاريوكي + غناء تقريبي بضغطة واحدة</p>
           </div>
         </div>
 
